@@ -1,58 +1,57 @@
-package awg
+package hy2
 
 import (
-	"context"
 	"encoding/binary"
 	"errors"
 	"io"
-	"log"
 	"net"
 	"net/netip"
 	"strconv"
+	"sync"
 	"time"
 
-	"github.com/amnezia-vpn/amneziawg-go/tun/netstack"
+	"github.com/apernet/hysteria/core/v2/client"
 )
 
-// serveSocks accepts SOCKS5 clients on ln and routes them through the AmneziaWG netstack tnet.
-func serveSocks(ln net.Listener, tnet *netstack.Net) {
+// serveSocks accepts SOCKS5 clients on ln and routes them through the Hysteria2 client hc.
+func serveSocks(ln net.Listener, hc client.Client) {
 	for {
 		c, err := ln.Accept()
 		if err != nil {
 			return // listener closed
 		}
-		go handleSocks(c, tnet)
+		go handleSocks(c, hc)
 	}
 }
 
-func handleSocks(client net.Conn, tnet *netstack.Net) {
-	defer client.Close()
-	_ = client.SetDeadline(time.Now().Add(30 * time.Second))
+func handleSocks(conn net.Conn, hc client.Client) {
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
 
 	br := make([]byte, 2)
-	if _, err := io.ReadFull(client, br); err != nil || br[0] != 0x05 {
+	if _, err := io.ReadFull(conn, br); err != nil || br[0] != 0x05 {
 		return
 	}
 	methods := make([]byte, int(br[1]))
-	if _, err := io.ReadFull(client, methods); err != nil {
+	if _, err := io.ReadFull(conn, methods); err != nil {
 		return
 	}
-	// We only offer no-auth (the proxy is loopback-only).
-	if _, err := client.Write([]byte{0x05, 0x00}); err != nil {
+	// No-auth only (loopback proxy).
+	if _, err := conn.Write([]byte{0x05, 0x00}); err != nil {
 		return
 	}
 
 	// Request: VER CMD RSV ATYP DST.ADDR DST.PORT
 	head := make([]byte, 4)
-	if _, err := io.ReadFull(client, head); err != nil || head[0] != 0x05 {
+	if _, err := io.ReadFull(conn, head); err != nil || head[0] != 0x05 {
 		return
 	}
-	host, err := readSocksAddr(client, head[3])
+	host, err := readSocksAddr(conn, head[3])
 	if err != nil {
 		return
 	}
 	portBuf := make([]byte, 2)
-	if _, err := io.ReadFull(client, portBuf); err != nil {
+	if _, err := io.ReadFull(conn, portBuf); err != nil {
 		return
 	}
 	port := int(binary.BigEndian.Uint16(portBuf))
@@ -60,102 +59,106 @@ func handleSocks(client net.Conn, tnet *netstack.Net) {
 
 	switch head[1] {
 	case 0x01: // CONNECT
-		socksTCPConnect(client, tnet, target)
+		socksTCPConnect(conn, hc, target)
 	case 0x03: // UDP ASSOCIATE
-		socksUDPAssociate(client, tnet)
+		socksUDPAssociate(conn, hc)
 	default:
-		_ = writeSocksReply(client, 0x07) // command not supported
+		_ = writeSocksReply(conn, 0x07) // command not supported
 	}
 }
 
-func socksTCPConnect(client net.Conn, tnet *netstack.Net, target string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	remote, err := tnet.DialContext(ctx, "tcp", target)
+func socksTCPConnect(conn net.Conn, hc client.Client, target string) {
+	remote, err := hc.TCP(target)
 	if err != nil {
-		// Only failures are logged (success would be one line per connection → journal spam).
-		log.New(logSink, "", 0).Printf("socks connect to %s failed: %v", target, err)
-		_ = writeSocksReply(client, 0x05) // connection refused
+		_ = writeSocksReply(conn, 0x05) // connection refused
 		return
 	}
 	defer remote.Close()
-	if err := writeSocksReply(client, 0x00); err != nil {
+	if err := writeSocksReply(conn, 0x00); err != nil {
 		return
 	}
-	_ = client.SetDeadline(time.Time{})
-	pipe(client, remote)
+	_ = conn.SetDeadline(time.Time{})
+	pipe(conn, remote)
 }
 
-// socksUDPAssociate opens a loopback UDP relay socket the client sends datagrams to, parses each
-// SOCKS5 UDP header, and forwards the payload to the target through the AmneziaWG netstack.
-func socksUDPAssociate(client net.Conn, tnet *netstack.Net) {
+// socksUDPAssociate opens a loopback UDP relay, multiplexes the client's datagrams over a single
+// Hysteria2 UDP session (HyUDPConn), and wraps replies back to the client.
+func socksUDPAssociate(ctrl net.Conn, hc client.Client) {
 	relay, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
-		_ = writeSocksReply(client, 0x01)
+		_ = writeSocksReply(ctrl, 0x01)
 		return
 	}
 	defer relay.Close()
 
+	hu, err := hc.UDP()
+	if err != nil {
+		_ = writeSocksReply(ctrl, 0x01)
+		return
+	}
+	defer hu.Close()
+
 	bound := relay.LocalAddr().(*net.UDPAddr)
-	// Reply with the relay address the client must send UDP to.
 	rep := []byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0}
 	binary.BigEndian.PutUint16(rep[8:], uint16(bound.Port))
-	if _, err := client.Write(rep); err != nil {
+	if _, err := ctrl.Write(rep); err != nil {
 		return
 	}
 
-	// Per-target UDP conns through the tunnel; return packets are wrapped back to the client addr.
-	// The netstack Dial returns a gVisor gonet conn (net.Conn), NOT *net.UDPConn — never assert.
-	conns := make(map[string]net.Conn)
-	defer func() {
-		for _, c := range conns {
-			_ = c.Close()
+	// Track the client's source addr so replies (which arrive by domain/ip target) go back to it.
+	var clientAddr udpAddrHolder
+
+	// Close the relay + UDP session when the TCP control connection drops.
+	go func() { io.Copy(io.Discard, ctrl); relay.Close(); hu.Close() }()
+
+	// Replies: read from the Hysteria2 UDP session and forward (SOCKS5-wrapped) to the client.
+	go func() {
+		for {
+			data, from, rerr := hu.Receive()
+			if rerr != nil {
+				return
+			}
+			ca := clientAddr.get()
+			if ca == nil {
+				continue
+			}
+			host, portStr, serr := net.SplitHostPort(from)
+			if serr != nil {
+				continue
+			}
+			p, _ := strconv.Atoi(portStr)
+			out := buildUDPReply(host, p, data)
+			if _, werr := relay.WriteToUDP(out, ca); werr != nil {
+				return
+			}
 		}
 	}()
 
-	// Close the relay when the TCP control connection drops.
-	go func() { io.Copy(io.Discard, client); relay.Close() }()
-
 	buf := make([]byte, 64*1024)
 	for {
-		n, from, err := relay.ReadFromUDP(buf)
-		if err != nil {
+		n, from, rerr := relay.ReadFromUDP(buf)
+		if rerr != nil {
 			return
 		}
+		clientAddr.set(from)
 		dstHost, dstPort, payload, ok := parseUDPRequest(buf[:n])
 		if !ok {
 			continue
 		}
-		target := net.JoinHostPort(dstHost, strconv.Itoa(dstPort))
-		uc := conns[target]
-		if uc == nil {
-			rc, derr := tnet.Dial("udp", target)
-			if derr != nil {
-				continue
-			}
-			uc = rc
-			conns[target] = uc
-			go udpReturn(relay, uc, from, dstHost, dstPort)
+		if serr := hu.Send(payload, net.JoinHostPort(dstHost, strconv.Itoa(dstPort))); serr != nil {
+			return
 		}
-		_, _ = uc.Write(payload)
 	}
 }
 
-// udpReturn reads replies from the tunnel UDP conn and forwards them (SOCKS5-wrapped) to client.
-func udpReturn(relay *net.UDPConn, uc net.Conn, client *net.UDPAddr, host string, port int) {
-	buf := make([]byte, 64*1024)
-	for {
-		_ = uc.SetReadDeadline(time.Now().Add(60 * time.Second))
-		n, err := uc.Read(buf)
-		if err != nil {
-			return
-		}
-		out := buildUDPReply(host, port, buf[:n])
-		if _, err := relay.WriteToUDP(out, client); err != nil {
-			return
-		}
-	}
+// udpAddrHolder is a tiny mutex-guarded holder for the client's UDP source address.
+type udpAddrHolder struct {
+	mu sync.Mutex
+	a  *net.UDPAddr
 }
+
+func (h *udpAddrHolder) set(a *net.UDPAddr) { h.mu.Lock(); h.a = a; h.mu.Unlock() }
+func (h *udpAddrHolder) get() *net.UDPAddr  { h.mu.Lock(); defer h.mu.Unlock(); return h.a }
 
 func readSocksAddr(r io.Reader, atyp byte) (string, error) {
 	switch atyp {
