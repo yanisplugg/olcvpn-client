@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-package rtpopus
+package rtpopus2
 
 import (
 	"errors"
@@ -13,11 +13,11 @@ import (
 	pionudp "github.com/pion/transport/v4/udp"
 )
 
-// bufPool устраняет per-packet heap-аллокацию на горячих путях чтения/записи
-// серверного wrapped PacketConn.
+// bufPool устраняет per-packet heap-аллокацию на горячих путях серверного
+// wrapped PacketConn.
 var bufPool = sync.Pool{
 	New: func() any {
-		b := make([]byte, 1600+Overhead)
+		b := make([]byte, 1600+overhead)
 		return &b
 	},
 }
@@ -30,7 +30,7 @@ func Listen(addr *net.UDPAddr, key []byte) (dtlsnet.PacketListener, error) {
 	}
 	inner, err := pionudp.Listen("udp", addr)
 	if err != nil {
-		return nil, fmt.Errorf("rtpopus:udp listen: %w", err)
+		return nil, fmt.Errorf("rtpopus2:udp listen: %w", err)
 	}
 	return &packetListener{
 		inner: dtlsnet.PacketListenerFromListener(inner),
@@ -58,8 +58,8 @@ func (l *packetListener) Accept() (net.PacketConn, net.Addr, error) {
 func (l *packetListener) Close() error   { return l.inner.Close() }
 func (l *packetListener) Addr() net.Addr { return l.inner.Addr() }
 
-// packetConn - per-peer net.PacketConn, AEAD-оборачивающий чтение/запись
-// через bufPool для allocation-free горячего пути.
+// packetConn - per-peer net.PacketConn, AEAD-оборачивающий чтение/запись через
+// bufPool для allocation-free горячего пути.
 type packetConn struct {
 	inner net.PacketConn
 	conn  *Conn
@@ -68,7 +68,7 @@ type packetConn struct {
 func (c *packetConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	bp := bufPool.Get().(*[]byte) //nolint:errcheck // pool New always returns *[]byte
 	buf := *bp
-	need := len(p) + Overhead
+	need := len(p) + overhead
 	if cap(buf) < need {
 		buf = make([]byte, need)
 		*bp = buf
@@ -80,8 +80,8 @@ func (c *packetConn) ReadFrom(p []byte) (int, net.Addr, error) {
 		return 0, addr, err
 	}
 	wire := buf[:n]
-	if len(wire) < Overhead {
-		return 0, addr, errors.New("rtpopus:packet too short")
+	if len(wire) < overhead {
+		return 0, addr, errors.New("rtpopus2:packet too short")
 	}
 	m, err := c.conn.Unwrap(wire, p)
 	if err != nil {
@@ -91,7 +91,7 @@ func (c *packetConn) ReadFrom(p []byte) (int, net.Addr, error) {
 }
 
 func (c *packetConn) WriteTo(p []byte, addr net.Addr) (int, error) {
-	wireLen := Overhead + len(p)
+	wireLen := overhead + len(p)
 
 	bp := bufPool.Get().(*[]byte) //nolint:errcheck // pool New always returns *[]byte
 	out := *bp
