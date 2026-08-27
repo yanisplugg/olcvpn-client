@@ -525,7 +525,7 @@ data class LocationConfig(
 
         fun supportedTransportsForProvider(provider: String): List<String> {
             return when (normalizeProvider(provider)) {
-                PROVIDER_TELEMOST -> listOf(TRANSPORT_VP8CHANNEL, TRANSPORT_SEICHANNEL)
+                PROVIDER_TELEMOST -> listOf(TRANSPORT_DATACHANNEL, TRANSPORT_VP8CHANNEL, TRANSPORT_SEICHANNEL)
                 // The olcRTC core registers transports GLOBALLY and the auth provider is independent, so
                 // Jitsi can carry any of them — offer all three (datachannel stays the default/known-good).
                 PROVIDER_JITSI -> listOf(TRANSPORT_DATACHANNEL, TRANSPORT_VP8CHANNEL, TRANSPORT_SEICHANNEL)
