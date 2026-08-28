@@ -402,7 +402,8 @@ val buildOlcRtcLibWindowsArm64 = registerOlcRtcLibraryBuildTask(
 )
 
 val copyOlcRtcDataAssets = tasks.register<Copy>("copyOlcRtcDataAssets") {
-    from(olcrtcRepoDir.map { it.resolve("data") }) {
+    // names/surnames moved from olcrtc/data/ to olcrtc/internal/names/data/ upstream.
+    from(olcrtcRepoDir.map { it.resolve("internal/names/data") }) {
         include("names", "surnames")
     }
     into(generatedNativeResources.map { it.dir("olcrtc-data") })
