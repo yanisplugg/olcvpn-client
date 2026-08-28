@@ -663,63 +663,112 @@ func YpDnsttRunning() C.int {
 
 // ---------------------------------------------------------------------------
 // olcrtc (Stealth engine)
+//
+// Ported from the pre-b22f336 package-level mobile.* API (removed upstream) to
+// the new mobile.Runtime object API. Two Runtime instances mirror
+// the Android side (OlcboxVpnService.kt's mobileRuntime + OlcRtcConnectionChecker.kt's
+// own runtime): rtcRuntime owns the long-lived session (Start/WaitReady/Stop/Running),
+// rtcProbeRuntime is isolated for Check/Ping so a probe never touches session state.
+// Every exported C signature below is kept byte-for-byte identical to before the
+// port - sharedUI/src/jvmMain/kotlin/.../desktop/YpTunCore.kt's JNA interface still
+// declares the old void Set*/Stop, so new validation errors from the setters are
+// logged rather than returned; only YpRtcStart already returned an error string.
+
+var (
+	rtcRuntime      = mobile.New()
+	rtcProbeRuntime = mobile.New()
+)
+
+func rtcLogSetErr(field string, err error) {
+	if err != nil {
+		pushLog("olcrtc", "set "+field+": "+err.Error())
+	}
+}
 
 //export YpRtcVersion
 func YpRtcVersion() *C.char { return cs(mobile.Version()) }
 
 //export YpRtcSetTransport
-func YpRtcSetTransport(transport *C.char) { mobile.SetTransport(C.GoString(transport)) }
+func YpRtcSetTransport(transport *C.char) {
+	rtcLogSetErr("transport", rtcRuntime.SetTransport(C.GoString(transport)))
+}
 
 //export YpRtcSetTelemostCookies
-func YpRtcSetTelemostCookies(cookies *C.char) { mobile.SetTelemostCookies(C.GoString(cookies)) }
+func YpRtcSetTelemostCookies(cookies *C.char) { rtcRuntime.SetTelemostCookies(C.GoString(cookies)) }
 
 //export YpRtcSetDNS
-func YpRtcSetDNS(dnsServer *C.char) { mobile.SetDNS(C.GoString(dnsServer)) }
+func YpRtcSetDNS(dnsServer *C.char) {
+	rtcLogSetErr("DNS", rtcRuntime.SetDNS(C.GoString(dnsServer)))
+}
 
 //export YpRtcSetSocksListenHost
-func YpRtcSetSocksListenHost(host *C.char) { mobile.SetSocksListenHost(C.GoString(host)) }
+func YpRtcSetSocksListenHost(host *C.char) {
+	rtcLogSetErr("SOCKS host", rtcRuntime.SetSocksListenHost(C.GoString(host)))
+}
 
 //export YpRtcSetVP8Options
-func YpRtcSetVP8Options(fps, batchSize C.int) { mobile.SetVP8Options(int(fps), int(batchSize)) }
+func YpRtcSetVP8Options(fps, batchSize C.int) {
+	rtcLogSetErr("VP8 options", rtcRuntime.SetVP8Options(int(fps), int(batchSize)))
+}
 
 //export YpRtcSetLivenessOptions
 func YpRtcSetLivenessOptions(intervalMs, timeoutMs, failures C.int) {
-	mobile.SetLivenessOptions(int(intervalMs), int(timeoutMs), int(failures))
+	rtcLogSetErr("liveness options", rtcRuntime.SetLivenessOptions(int(intervalMs), int(timeoutMs), int(failures)))
 }
 
 //export YpRtcStart
 func YpRtcStart(carrier, transport, roomID, clientID, keyHex *C.char, socksPort C.int, socksUser, socksPass *C.char) *C.char {
-	mobile.SetLogWriter(tagWriter{"olcrtc"})
-	t := C.GoString(transport)
-	if t == "" {
-		return errOut(mobile.Start(
-			C.GoString(carrier), C.GoString(roomID), C.GoString(clientID), C.GoString(keyHex),
-			int(socksPort), C.GoString(socksUser), C.GoString(socksPass)))
+	rtcRuntime.SetLogWriter(tagWriter{"olcrtc"})
+	if err := rtcRuntime.SetProvider(C.GoString(carrier)); err != nil {
+		return errOut(err)
 	}
-	return errOut(mobile.StartWithTransport(
-		C.GoString(carrier), t, C.GoString(roomID), C.GoString(clientID), C.GoString(keyHex),
-		int(socksPort), C.GoString(socksUser), C.GoString(socksPass)))
+	if t := C.GoString(transport); t != "" {
+		if err := rtcRuntime.SetTransport(t); err != nil {
+			return errOut(err)
+		}
+	}
+	if err := rtcRuntime.SetRoom(C.GoString(roomID)); err != nil {
+		return errOut(err)
+	}
+	rtcRuntime.SetDeviceID(C.GoString(clientID))
+	if err := rtcRuntime.SetKey(C.GoString(keyHex)); err != nil {
+		return errOut(err)
+	}
+	if err := rtcRuntime.SetSocksPort(int(socksPort)); err != nil {
+		return errOut(err)
+	}
+	if err := rtcRuntime.SetSocksCredentials(C.GoString(socksUser), C.GoString(socksPass)); err != nil {
+		return errOut(err)
+	}
+	return errOut(rtcRuntime.Start())
 }
 
 //export YpRtcWaitReady
-func YpRtcWaitReady(timeoutMs C.int) *C.char { return errOut(mobile.WaitReady(int(timeoutMs))) }
+func YpRtcWaitReady(timeoutMs C.int) *C.char { return errOut(rtcRuntime.WaitReady(int(timeoutMs))) }
 
+// YpRtcStop stays void to match the existing JNA declaration; 0 asks Runtime.Stop
+// for its own default timeout, same as the Android side's mobileRuntime.stop(0).
+//
 //export YpRtcStop
-func YpRtcStop() { mobile.Stop() }
+func YpRtcStop() {
+	if err := rtcRuntime.Stop(0); err != nil {
+		pushLog("olcrtc", "stop: "+err.Error())
+	}
+}
 
 //export YpRtcRunning
 func YpRtcRunning() C.int {
-	if mobile.IsRunning() {
+	if rtcRuntime.IsRunning() {
 		return 1
 	}
 	return 0
 }
 
-// YpRtcCheck mirrors mobile.Check: returns ms or -1 (error text discarded into the log bus).
+// YpRtcCheck mirrors Runtime.Check: returns ms or -1 (error text discarded into the log bus).
 //
 //export YpRtcCheck
 func YpRtcCheck(carrier, transport, roomID, clientID, keyHex *C.char, socksPort, timeoutMs, vp8FPS, vp8Batch C.int) C.longlong {
-	ms, err := mobile.Check(
+	ms, err := rtcProbeRuntime.Check(
 		C.GoString(carrier), C.GoString(transport), C.GoString(roomID), C.GoString(clientID), C.GoString(keyHex),
 		int(socksPort), int(timeoutMs), int(vp8FPS), int(vp8Batch))
 	if err != nil {
@@ -731,11 +780,11 @@ func YpRtcCheck(carrier, transport, roomID, clientID, keyHex *C.char, socksPort,
 	return C.longlong(ms)
 }
 
-// YpRtcPing mirrors mobile.Ping: returns ms or -1.
+// YpRtcPing mirrors Runtime.Ping: returns ms or -1.
 //
 //export YpRtcPing
 func YpRtcPing(carrier, transport, roomID, clientID, keyHex *C.char, socksPort, timeoutMs C.int, pingURL *C.char, vp8FPS, vp8Batch C.int) C.longlong {
-	ms, err := mobile.Ping(
+	ms, err := rtcProbeRuntime.Ping(
 		C.GoString(carrier), C.GoString(transport), C.GoString(roomID), C.GoString(clientID), C.GoString(keyHex),
 		int(socksPort), int(timeoutMs), C.GoString(pingURL), int(vp8FPS), int(vp8Batch))
 	if err != nil {
